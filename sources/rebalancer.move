@@ -1,5 +1,5 @@
 module liquidity_rebalancer::rebalancer {
-    use sui::object::{Self, UID};
+    use sui::object::{Self, UID, ID};
     use sui::transfer;
     use sui::tx_context::{Self, TxContext};
     use sui::coin::{Self, Coin};
@@ -7,18 +7,23 @@ module liquidity_rebalancer::rebalancer {
     use sui::clock::{Self, Clock};
     use sui::table::{Self, Table};
     use sui::math;
-    
+    use sui::event;
+
     /// Errors
     const E_INSUFFICIENT_BALANCE: u64 = 1;
     const E_INVALID_FEE_PERCENTAGE: u64 = 2;
     const E_UNAUTHORIZED: u64 = 3;
     const E_TOO_EARLY_TO_REBALANCE: u64 = 4;
     const E_INVALID_PRICE: u64 = 5;
+    const E_INVALID_AMOUNT: u64 = 6;
+    const E_INVALID_TIMESTAMP: u64 = 7;
 
-    /// Constants for rebalancing logic
-    const VOLATILITY_WINDOW: u64 = 3600000; // 1 hour in milliseconds
-    const MAX_PRICE_CHANGE_THRESHOLD: u64 = 50; // 5% price change threshold
-    const MIN_REBALANCE_INTERVAL: u64 = 300000; // 5 minutes in milliseconds
+    /// Constants
+    const VOLATILITY_WINDOW: u64 = 3600000;
+    const MAX_PRICE_CHANGE_THRESHOLD: u64 = 50;
+    const MIN_REBALANCE_INTERVAL: u64 = 300000;
+    const MIN_DEPOSIT_AMOUNT: u64 = 1000000; // 0.001 SUI
+    const PRECISION_MULTIPLIER: u64 = 1000000; // 6 decimals
 
     /// Stores the configuration for the rebalancer
     struct RebalancerConfig has key {
@@ -60,6 +65,9 @@ module liquidity_rebalancer::rebalancer {
     struct PriceHistory has store {
         prices: Table<u64, u64>, // timestamp -> price
         last_prices_count: u64,
+        last_timestamp: u64,
+        running_min: u64,
+        running_max: u64,
     }
 
     /// Initialize the rebalancer
@@ -73,6 +81,9 @@ module liquidity_rebalancer::rebalancer {
             price_history: PriceHistory {
                 prices: table::new(ctx),
                 last_prices_count: 0,
+                last_timestamp: 0,
+                running_min: 0,
+                running_max: 0,
             }
         };
 
@@ -102,6 +113,8 @@ module liquidity_rebalancer::rebalancer {
         ctx: &mut TxContext
     ) {
         let amount = coin::value(&coin);
+        assert!(amount >= MIN_DEPOSIT_AMOUNT, E_INVALID_AMOUNT);
+        
         let fee_amount = calculate_fee(pool, amount);
         
         // Convert Coin to Balance and add to pool
@@ -148,9 +161,8 @@ module liquidity_rebalancer::rebalancer {
 
     /// Calculate fee based on current market conditions
     fun calculate_fee(pool: &LiquidityPool, amount: u64): u64 {
-        // For now, we'll use a simple fee calculation
-        // In the next phase, we'll make this more sophisticated with volatility
-        (amount * pool.current_fee_rate) / 100_000 // Fee in basis points
+        // Higher precision fee calculation
+        ((amount * pool.current_fee_rate * PRECISION_MULTIPLIER) / 100_000) / PRECISION_MULTIPLIER
     }
 
     /// Update fee rate based on market conditions
@@ -175,22 +187,40 @@ module liquidity_rebalancer::rebalancer {
         clock: &Clock,
         ctx: &mut TxContext
     ) {
+        // Add admin check
+        assert!(tx_context::sender(ctx) == config.admin, E_UNAUTHORIZED);
         assert!(new_price > 0, E_INVALID_PRICE);
         
         let timestamp = clock::timestamp_ms(clock);
-        table::add(&mut config.price_history.prices, timestamp, new_price);
+        // Ensure monotonic timestamps
+        assert!(timestamp > config.price_history.last_timestamp, E_INVALID_TIMESTAMP);
+        
+        // Update running min/max
+        if (config.price_history.last_prices_count == 0) {
+            config.price_history.running_min = new_price;
+            config.price_history.running_max = new_price;
+        } else {
+            if (new_price < config.price_history.running_min) {
+                config.price_history.running_min = new_price;
+            };
+            if (new_price > config.price_history.running_max) {
+                config.price_history.running_max = new_price;
+            };
+        };
+
+        table::set(&mut config.price_history.prices, timestamp, new_price);
+        config.price_history.last_timestamp = timestamp;
         config.price_history.last_prices_count = 
-            math::min(config.price_history.last_prices_count + 1, 24); // Keep last 24 prices
+            math::min(config.price_history.last_prices_count + 1, 24);
         
         pool.current_price = new_price;
-        pool.volatility_score = calculate_volatility(config, clock);
+        pool.volatility_score = calculate_volatility(config);
         
-        // Adjust fee based on volatility
         adjust_fee_rate(config, pool);
     }
 
     /// Calculate volatility based on price history
-    fun calculate_volatility(config: &RebalancerConfig, clock: &Clock): u64 {
+    fun calculate_volatility(config: &RebalancerConfig): u64 {
         if (config.price_history.last_prices_count < 2) {
             return 0
         };
